@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import Peer from 'peerjs';
 import {
   Mic,
@@ -7,134 +7,254 @@ import {
   VideoOff,
   Phone,
   PhoneOff,
-  PhoneCall,
   PhoneIncoming,
   Monitor,
   MonitorOff,
+  SwitchCamera,
   Copy,
   Check,
   LayoutGrid,
   Maximize,
   Minimize,
   Clock,
-  ArrowLeftRight,
+  Sparkles,
+  Share2,
 } from 'lucide-react';
 
+import VideoTile from './components/VideoTile';
+import {
+  startRingtone,
+  stopRingtone,
+  playConnectChime,
+  playDisconnectChime,
+} from './utils/audioEffects';
+
+// List of high-availability STUN servers for NAT traversal
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
+
 export default function App() {
-  const [peerId, setPeerId] = useState('');
-  const [remotePeerIdValue, setRemotePeerIdValue] = useState('');
+  // Streams
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
+
+  // Connection & Room state
+  const [myPeerId, setMyPeerId] = useState('');
+  const [roomName, setRoomName] = useState('');
+  const [directDialInput, setDirectDialInput] = useState('');
   const [callStatus, setCallStatus] = useState('Idle'); // 'Idle' | 'Calling' | 'Connected' | 'Incoming'
-  const [incomingCall, setIncomingCall] = useState(null);
+  const [incomingCallData, setIncomingCallData] = useState(null);
+  const [callDuration, setCallDuration] = useState(0);
+
+  // Controls state
   const [isAudioMuted, setIsAudioMuted] = useState(false);
   const [isVideoMuted, setIsVideoMuted] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isFacingUser, setIsFacingUser] = useState(true);
+  const [hasMultipleCameras, setHasMultipleCameras] = useState(false);
   const [layoutMode, setLayoutMode] = useState('pip'); // 'pip' | 'grid'
-  const [isSwapped, setIsSwapped] = useState(false); // for PiP swap main vs thumbnail
-  const [callDuration, setCallDuration] = useState(0);
-  const [toastMessage, setToastMessage] = useState('');
-  const [errorMessage, setErrorMessage] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [isSwapped, setIsSwapped] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
-  const peerInstance = useRef(null);
-  const currentCall = useRef(null);
+  // Feedback state
+  const [toastMessage, setToastMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [linkCopied, setLinkCopied] = useState(false);
+
+  // Refs
+  const peerRef = useRef(null);
+  const activeCallRef = useRef(null);
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
-  const stageContainerRef = useRef(null);
-  const toastTimeoutRef = useRef(null);
+  const stageRef = useRef(null);
+  const toastTimerRef = useRef(null);
 
-  // Helper: show brief toast
-  const showToast = (msg) => {
+  // Toast notifier
+  const showToast = useCallback((msg) => {
     setToastMessage(msg);
-    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
-    toastTimeoutRef.current = setTimeout(() => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
       setToastMessage('');
     }, 2800);
-  };
-
-  // Timer for active call
-  useEffect(() => {
-    let timer;
-    if (callStatus === 'Connected') {
-      setCallDuration(0);
-      timer = setInterval(() => {
-        setCallDuration((prev) => prev + 1);
-      }, 1000);
-    } else {
-      setCallDuration(0);
-    }
-    return () => clearInterval(timer);
-  }, [callStatus]);
+  }, []);
 
   // Format call duration MM:SS
-  const formatTime = (seconds) => {
+  const formatTimer = (seconds) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Initialize Media Devices & PeerJS on mount
+  // Call timer interval
   useEffect(() => {
-    let peer = null;
+    let interval;
+    if (callStatus === 'Connected') {
+      setCallDuration(0);
+      interval = setInterval(() => {
+        setCallDuration((prev) => prev + 1);
+      }, 1000);
+    } else {
+      setCallDuration(0);
+    }
+    return () => clearInterval(interval);
+  }, [callStatus]);
 
-    async function init() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: true,
-        });
-        localStreamRef.current = stream;
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
-      } catch (err) {
-        console.error('Media devices error:', err);
-        setErrorMessage(
-          'Camera/Microphone permission denied or device not found. Please allow access.'
-        );
+  // Check if device has multiple cameras (mobile front/rear)
+  useEffect(() => {
+    navigator.mediaDevices?.enumerateDevices?.().then((devices) => {
+      const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+      setHasMultipleCameras(videoInputs.length > 1);
+    }).catch(() => {});
+  }, []);
+
+  // Initialize local webcam / mic
+  const initLocalStream = useCallback(async (facingMode = 'user') => {
+    try {
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
-
-      peer = new Peer({
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-          ],
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
         },
       });
 
-      peer.on('open', (id) => {
-        setPeerId(id);
+      localStreamRef.current = stream;
+      setLocalStream(stream);
 
-        const params = new URLSearchParams(window.location.search);
-        const targetId = params.get('call');
-        if (targetId && targetId !== id) {
-          setRemotePeerIdValue(targetId);
-          showToast(`Invite from peer detected. Click 'Call' to connect!`);
+      // If already in a call, replace tracks on the WebRTC connection
+      if (activeCallRef.current?.peerConnection) {
+        const videoTrack = stream.getVideoTracks()[0];
+        const senders = activeCallRef.current.peerConnection.getSenders();
+        const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+        if (videoSender && videoTrack) {
+          videoSender.replaceTrack(videoTrack);
+        }
+      }
+      return stream;
+    } catch (err) {
+      console.error('Camera/Mic initialization failed:', err);
+      setErrorMessage(
+        'Unable to access camera or microphone. Please check permissions.'
+      );
+      return null;
+    }
+  }, []);
+
+  // Initialize Peer and Room
+  useEffect(() => {
+    let peer = null;
+    let heartbeatTimer = null;
+
+    async function setupRoomAndPeer() {
+      // 1. Get initial media stream
+      const stream = await initLocalStream('user');
+
+      // 2. Parse room name from query param or generate friendly room name
+      const params = new URLSearchParams(window.location.search);
+      let currentRoom = params.get('room');
+      const isNewRoom = !currentRoom;
+
+      if (!currentRoom) {
+        currentRoom = 'room-' + Math.random().toString(36).substring(2, 8);
+        const newUrl = `${window.location.origin}${window.location.pathname}?room=${currentRoom}`;
+        window.history.replaceState(null, '', newUrl);
+      }
+      setRoomName(currentRoom);
+
+      // Clean deterministic IDs for room auto-peering:
+      // Host uses: `vcr-${currentRoom}-host`
+      // Guest uses: `vcr-${currentRoom}-guest-${random}`
+      const targetHostId = `vcr-${currentRoom}-host`;
+      const isJoiningAsGuest = !isNewRoom;
+
+      const myIdToRegister = isJoiningAsGuest
+        ? `vcr-${currentRoom}-guest-${Math.random().toString(36).substring(2, 6)}`
+        : targetHostId;
+
+      peer = new Peer(myIdToRegister, {
+        config: { iceServers: ICE_SERVERS },
+      });
+
+      peer.on('open', (id) => {
+        setMyPeerId(id);
+        console.log('Peer connected with ID:', id);
+
+        // If joining as guest into an existing room, auto-call the host!
+        if (isJoiningAsGuest) {
+          showToast(`Connecting to room '${currentRoom}'...`);
+          setTimeout(() => {
+            initiateCall(targetHostId, stream || localStreamRef.current, peer);
+          }, 600);
         }
       });
 
-      peer.on('call', (call) => {
-        setIncomingCall(call);
+      // Handle room host ID collision (if host already exists, fallback to guest and call host)
+      peer.on('error', (err) => {
+        console.warn('Peer error:', err.type, err);
+        if (err.type === 'unavailable-id') {
+          // Host was already present! Reconnect as guest
+          const guestId = `vcr-${currentRoom}-guest-${Math.random().toString(36).substring(2, 6)}`;
+          peer.destroy();
+          const fallbackPeer = new Peer(guestId, { config: { iceServers: ICE_SERVERS } });
+          fallbackPeer.on('open', (newId) => {
+            setMyPeerId(newId);
+            peerRef.current = fallbackPeer;
+            showToast(`Joining room '${currentRoom}'...`);
+            initiateCall(targetHostId, stream || localStreamRef.current, fallbackPeer);
+          });
+          bindPeerEvents(fallbackPeer);
+          peerRef.current = fallbackPeer;
+          return;
+        }
+        setErrorMessage(`Connection notice: ${err.message || err.type}`);
+      });
+
+      bindPeerEvents(peer);
+      peerRef.current = peer;
+
+      // 3. Heartbeat to keep PeerJS cloud WebSocket alive & reconnect if disconnected
+      heartbeatTimer = setInterval(() => {
+        if (peerRef.current && !peerRef.current.destroyed) {
+          if (peerRef.current.disconnected) {
+            peerRef.current.reconnect();
+          }
+        }
+      }, 15000);
+    }
+
+    function bindPeerEvents(p) {
+      p.on('call', (incoming) => {
+        // Play ringtone
+        startRingtone();
+        setIncomingCallData(incoming);
         setCallStatus('Incoming');
       });
 
-      peer.on('error', (err) => {
-        console.error('Peer error:', err);
-        setErrorMessage(`Peer connection error: ${err.type || err.message}`);
+      p.on('disconnected', () => {
+        console.log('Peer disconnected from signaling server, reconnecting...');
+        p.reconnect();
       });
-
-      peerInstance.current = peer;
     }
 
-    init();
+    setupRoomAndPeer();
 
     return () => {
-      if (currentCall.current) currentCall.current.close();
-      if (peerInstance.current) peerInstance.current.destroy();
+      stopRingtone();
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (activeCallRef.current) activeCallRef.current.close();
+      if (peerRef.current) peerRef.current.destroy();
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
@@ -144,91 +264,92 @@ export default function App() {
     };
   }, []);
 
-  // Answer incoming call
-  const answerCall = () => {
-    if (!incomingCall) return;
+  // Initiate call
+  const initiateCall = (remoteId, currentLocalStream, peerInstanceOverride) => {
+    const p = peerInstanceOverride || peerRef.current;
+    if (!remoteId || !p) return;
 
-    incomingCall.answer(localStreamRef.current);
-
-    incomingCall.on('stream', (remoteStream) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = remoteStream;
-      }
-    });
-
-    incomingCall.on('close', () => {
-      endCall();
-    });
-
-    currentCall.current = incomingCall;
-    setCallStatus('Connected');
-    setIncomingCall(null);
-    showToast('Call connected');
-  };
-
-  // Reject incoming call
-  const rejectCall = () => {
-    if (incomingCall) {
-      incomingCall.close();
-      setIncomingCall(null);
-      setCallStatus('Idle');
-      showToast('Call declined');
-    }
-  };
-
-  // Dial a peer
-  const callPeer = (remoteId) => {
-    if (!remoteId || !peerInstance.current) return;
     setCallStatus('Calling');
     setErrorMessage('');
+    startRingtone();
 
-    const call = peerInstance.current.call(remoteId, localStreamRef.current);
+    const streamToSend = currentLocalStream || localStreamRef.current;
+    const call = p.call(remoteId, streamToSend);
 
     if (!call) {
-      setErrorMessage('Could not initiate call to peer.');
+      stopRingtone();
       setCallStatus('Idle');
+      setErrorMessage('Could not initiate call to peer.');
       return;
     }
 
-    call.on('stream', (remoteStream) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = remoteStream;
-      }
+    bindCallEvents(call);
+    activeCallRef.current = call;
+  };
+
+  // Bind call stream events
+  const bindCallEvents = (call) => {
+    call.on('stream', (incomingStream) => {
+      stopRingtone();
+      playConnectChime();
+      setRemoteStream(incomingStream);
       setCallStatus('Connected');
-      showToast('Peer joined call');
+      showToast('Connected with peer');
     });
 
     call.on('close', () => {
-      endCall();
-      showToast('Call ended by peer');
+      handleCallEnd();
     });
 
     call.on('error', (err) => {
-      console.error('Call error:', err);
-      setErrorMessage(`Call error: ${err.message || 'connection failed'}`);
-      endCall();
+      console.error('Call runtime error:', err);
+      handleCallEnd();
     });
+  };
 
-    currentCall.current = call;
+  // Answer incoming call
+  const answerIncomingCall = () => {
+    if (!incomingCallData) return;
+
+    stopRingtone();
+    const stream = localStreamRef.current;
+    incomingCallData.answer(stream);
+
+    bindCallEvents(incomingCallData);
+    activeCallRef.current = incomingCallData;
+    setCallStatus('Connected');
+    setIncomingCallData(null);
+  };
+
+  // Reject incoming call
+  const rejectIncomingCall = () => {
+    stopRingtone();
+    if (incomingCallData) {
+      incomingCallData.close();
+      setIncomingCallData(null);
+    }
+    setCallStatus('Idle');
+    showToast('Call declined');
   };
 
   // End active call
-  const endCall = () => {
+  const handleCallEnd = () => {
+    stopRingtone();
+    playDisconnectChime();
     if (isScreenSharing) {
       stopScreenShare();
     }
-    if (currentCall.current) {
-      currentCall.current.close();
-      currentCall.current = null;
+    if (activeCallRef.current) {
+      activeCallRef.current.close();
+      activeCallRef.current = null;
     }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = null;
-    }
+    setRemoteStream(null);
     setCallStatus('Idle');
-    setIncomingCall(null);
+    setIncomingCallData(null);
+    showToast('Call ended');
   };
 
-  // Audio Toggle
+  // Toggle Microphone
   const toggleAudio = () => {
     if (localStreamRef.current) {
       const audioTracks = localStreamRef.current.getAudioTracks();
@@ -236,12 +357,12 @@ export default function App() {
         const nextState = !isAudioMuted;
         audioTracks.forEach((t) => (t.enabled = !nextState));
         setIsAudioMuted(nextState);
-        showToast(nextState ? 'Microphone muted' : 'Microphone unmuted');
+        showToast(nextState ? 'Microphone muted' : 'Microphone active');
       }
     }
   };
 
-  // Video Toggle
+  // Toggle Camera
   const toggleVideo = () => {
     if (localStreamRef.current) {
       const videoTracks = localStreamRef.current.getVideoTracks();
@@ -249,9 +370,18 @@ export default function App() {
         const nextState = !isVideoMuted;
         videoTracks.forEach((t) => (t.enabled = !nextState));
         setIsVideoMuted(nextState);
-        showToast(nextState ? 'Camera stopped' : 'Camera started');
+        showToast(nextState ? 'Camera turned off' : 'Camera turned on');
       }
     }
+  };
+
+  // Flip Mobile Camera (Front / Back)
+  const flipCamera = async () => {
+    if (isScreenSharing) return;
+    const nextMode = isFacingUser ? 'environment' : 'user';
+    setIsFacingUser(!isFacingUser);
+    showToast(`Switched to ${nextMode === 'user' ? 'front' : 'rear'} camera`);
+    await initLocalStream(nextMode);
   };
 
   // Screen Share Toggle
@@ -266,13 +396,12 @@ export default function App() {
         const screenTrack = screenStream.getVideoTracks()[0];
         screenStreamRef.current = screenStream;
 
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = screenStream;
-        }
+        // Temporarily replace local preview with screen share
+        setLocalStream(screenStream);
 
-        // Replace track on WebRTC connection if in call
-        if (currentCall.current && currentCall.current.peerConnection) {
-          const senders = currentCall.current.peerConnection.getSenders();
+        // Replace track on WebRTC sender
+        if (activeCallRef.current?.peerConnection) {
+          const senders = activeCallRef.current.peerConnection.getSenders();
           const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
           if (videoSender) {
             videoSender.replaceTrack(screenTrack);
@@ -286,7 +415,7 @@ export default function App() {
         setIsScreenSharing(true);
         showToast('Screen sharing started');
       } catch (err) {
-        console.warn('Screen share canceled/failed:', err);
+        console.warn('Screen share cancelled/not supported:', err);
       }
     }
   };
@@ -296,13 +425,12 @@ export default function App() {
       screenStreamRef.current.getTracks().forEach((t) => t.stop());
       screenStreamRef.current = null;
     }
+    // Revert to webcam
     if (localStreamRef.current) {
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current;
-      }
+      setLocalStream(localStreamRef.current);
       const webcamTrack = localStreamRef.current.getVideoTracks()[0];
-      if (currentCall.current && currentCall.current.peerConnection && webcamTrack) {
-        const senders = currentCall.current.peerConnection.getSenders();
+      if (activeCallRef.current?.peerConnection && webcamTrack) {
+        const senders = activeCallRef.current.peerConnection.getSenders();
         const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
         if (videoSender) {
           videoSender.replaceTrack(webcamTrack);
@@ -316,7 +444,7 @@ export default function App() {
   // Fullscreen Toggle
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
-      stageContainerRef.current?.requestFullscreen?.();
+      stageRef.current?.requestFullscreen?.();
       setIsFullscreen(true);
     } else {
       document.exitFullscreen?.();
@@ -324,113 +452,53 @@ export default function App() {
     }
   };
 
-  // Copy shareable link
-  const copyShareLink = () => {
-    if (!peerId) return;
-    const url = `${window.location.origin}${window.location.pathname}?call=${peerId}`;
+  // Copy shareable room link
+  const copyRoomLink = () => {
+    const url = window.location.href;
     navigator.clipboard.writeText(url);
-    setCopied(true);
-    showToast('Invite link copied to clipboard!');
-    setTimeout(() => setCopied(false), 2200);
+    setLinkCopied(true);
+    showToast('Room link copied! Send it to your friend to join.');
+    setTimeout(() => setLinkCopied(false), 2200);
   };
 
-  // Render Video Component
-  const renderLocalVideo = (isPipThumb = false) => (
-    <div
-      className={`video-card ${isPipThumb ? 'pip-thumbnail' : ''}`}
-      onClick={isPipThumb ? () => setIsSwapped(!isSwapped) : undefined}
-      title={isPipThumb ? 'Click to swap video' : ''}
-    >
-      <video
-        ref={localVideoRef}
-        autoPlay
-        playsInline
-        muted
-        className={`video-element ${!isScreenSharing ? 'mirrored' : ''}`}
-        style={{ display: isVideoMuted ? 'none' : 'block' }}
-      />
-      {isVideoMuted && (
-        <div className="video-off-avatar">
-          <div className="avatar-circle">YOU</div>
-          <span style={{ fontSize: '0.85rem' }}>Camera Off</span>
-        </div>
-      )}
-      <div className="video-overlay-bottom">
-        <span className={`mic-badge ${isAudioMuted ? 'muted' : ''}`}>
-          {isAudioMuted ? <MicOff size={14} /> : <Mic size={14} />}
-        </span>
-        <span>You {isScreenSharing ? '(Screen)' : ''}</span>
-        {isPipThumb && <ArrowLeftRight size={12} style={{ marginLeft: '4px', opacity: 0.7 }} />}
-      </div>
-    </div>
-  );
+  // Main vs PiP components calculation
+  const showMainStream = isSwapped ? localStream : remoteStream;
+  const showMainLabel = isSwapped ? 'You' : 'Peer';
+  const showMainIsLocal = isSwapped;
+  const showMainAudioMuted = isSwapped ? isAudioMuted : false;
+  const showMainVideoMuted = isSwapped ? isVideoMuted : false;
 
-  const renderRemoteVideo = (isPipThumb = false) => (
-    <div
-      className={`video-card ${isPipThumb ? 'pip-thumbnail' : ''}`}
-      onClick={isPipThumb ? () => setIsSwapped(!isSwapped) : undefined}
-      title={isPipThumb ? 'Click to swap video' : ''}
-    >
-      <video
-        ref={remoteVideoRef}
-        autoPlay
-        playsInline
-        className="video-element"
-        style={{ display: callStatus === 'Connected' ? 'block' : 'none' }}
-      />
-      {callStatus !== 'Connected' && (
-        <div className="video-off-avatar">
-          <div className="avatar-circle avatar-pulsing">
-            {callStatus === 'Calling' ? <PhoneCall size={32} /> : 'PEER'}
-          </div>
-          <span style={{ fontSize: '0.9rem', color: '#94a3b8' }}>
-            {callStatus === 'Calling'
-              ? 'Ringing peer...'
-              : 'Waiting for peer to connect...'}
-          </span>
-        </div>
-      )}
-      <div className="video-overlay-bottom">
-        <span className="mic-badge">
-          <Mic size={14} />
-        </span>
-        <span>
-          {callStatus === 'Connected'
-            ? 'Peer'
-            : callStatus === 'Calling'
-            ? 'Calling...'
-            : 'Remote Peer'}
-        </span>
-        {isPipThumb && <ArrowLeftRight size={12} style={{ marginLeft: '4px', opacity: 0.7 }} />}
-      </div>
-    </div>
-  );
+  const showPipStream = isSwapped ? remoteStream : localStream;
+  const showPipLabel = isSwapped ? 'Peer' : 'You';
+  const showPipIsLocal = !isSwapped;
+  const showPipAudioMuted = !isSwapped ? isAudioMuted : false;
+  const showPipVideoMuted = !isSwapped ? isVideoMuted : false;
 
   return (
-    <div className="app-viewport">
+    <div className="app-container">
       {/* Top Header */}
       <header className="app-header">
-        <div className="brand">
-          <div className="brand-icon">
-            <VideoIcon size={20} />
+        <div className="brand-section">
+          <div className="brand-logo">
+            <VideoIcon size={19} />
           </div>
-          <div>
-            <h1 className="brand-title">WebRTC Connect</h1>
+          <div className="brand-text">
+            <h1>WebRTC Meet</h1>
           </div>
         </div>
 
-        <div className="header-meta">
+        <div className="header-status-area">
           {callStatus === 'Connected' && (
-            <div className="timer-badge">
-              <Clock size={15} />
-              <span>{formatTime(callDuration)}</span>
+            <div className="call-timer">
+              <Clock size={13} />
+              <span>{formatTimer(callDuration)}</span>
             </div>
           )}
 
           <div
-            className={`status-pill ${
+            className={`status-badge ${
               callStatus === 'Connected'
-                ? 'online'
+                ? 'connected'
                 : callStatus === 'Calling' || callStatus === 'Incoming'
                 ? 'calling'
                 : ''
@@ -439,176 +507,210 @@ export default function App() {
             <span className="status-dot"></span>
             <span>
               {callStatus === 'Connected'
-                ? 'Connected'
+                ? 'In Call'
                 : callStatus === 'Calling'
                 ? 'Calling...'
                 : callStatus === 'Incoming'
                 ? 'Incoming Call'
-                : 'Ready'}
+                : 'Waiting for Peer'}
             </span>
           </div>
         </div>
       </header>
 
       {/* Incoming Call Notification Banner */}
-      {incomingCall && (
-        <div className="incoming-call-card">
+      {incomingCallData && (
+        <div className="incoming-call-banner">
           <div className="incoming-call-info">
-            <span className="incoming-call-title">Incoming Video Call</span>
-            <span className="incoming-call-caller">{incomingCall.peer}</span>
+            <h4>Incoming Call</h4>
+            <span>Peer is calling you...</span>
           </div>
-          <div style={{ display: 'flex', gap: '0.6rem' }}>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
             <button
-              className="btn-primary"
+              className="btn-action-primary"
               style={{ background: '#10b981' }}
-              onClick={answerCall}
+              onClick={answerIncomingCall}
             >
-              <PhoneIncoming size={16} /> Accept
+              <PhoneIncoming size={15} /> Accept
             </button>
             <button
-              className="btn-primary"
+              className="btn-action-primary"
               style={{ background: '#ef4444' }}
-              onClick={rejectCall}
+              onClick={rejectIncomingCall}
             >
-              <PhoneOff size={16} /> Decline
+              <PhoneOff size={15} /> Decline
             </button>
           </div>
         </div>
       )}
 
-      {/* Error Alert */}
-      {errorMessage && (
-        <div
-          style={{
-            background: 'rgba(239, 68, 68, 0.12)',
-            border: '1px solid rgba(239, 68, 68, 0.3)',
-            borderRadius: '0.5rem',
-            padding: '0.75rem 1rem',
-            color: '#f87171',
-            fontSize: '0.875rem',
-          }}
-        >
-          {errorMessage}
-        </div>
-      )}
-
-      {/* Lobby / Dial Bar */}
-      <div className="lobby-bar">
-        {/* Left: Your ID & Link */}
-        <div className="my-id-box">
-          <span className="id-label">Your ID:</span>
-          <span className="id-chip" title={peerId}>
-            {peerId || 'Generating...'}
+      {/* Room & Share Action Bar */}
+      <div className="action-bar">
+        {/* Room Info & Instant Link Sharing */}
+        <div className="room-info-pill">
+          <span className="room-label">Room:</span>
+          <span className="room-tag" title={roomName}>
+            {roomName || 'Creating...'}
           </span>
           <button
-            className="btn-ghost"
-            onClick={copyShareLink}
-            disabled={!peerId}
-            title="Copy invite URL"
+            className="btn-action-primary"
+            onClick={copyRoomLink}
+            title="Copy shareable link"
           >
-            {copied ? <Check size={14} color="#10b981" /> : <Copy size={14} />}
-            <span>{copied ? 'Copied Link' : 'Copy Link'}</span>
+            {linkCopied ? <Check size={14} /> : <Share2 size={14} />}
+            <span>{linkCopied ? 'Link Copied!' : 'Share Room Link'}</span>
           </button>
         </div>
 
-        {/* Center: Quick Hint */}
-        <div style={{ textAlign: 'center', fontSize: '0.8rem', color: '#64748b' }}>
-          Open in 2 tabs to test instantly
-        </div>
-
-        {/* Right: Dial Input & Call Button */}
-        <div className="dialer-box">
+        {/* Direct Peer Dial option */}
+        <div className="direct-call-group">
           <input
             type="text"
-            className="dial-input"
-            placeholder="Paste peer ID to call..."
-            value={remotePeerIdValue}
-            onChange={(e) => setRemotePeerIdValue(e.target.value)}
+            className="direct-input"
+            placeholder="Or dial Peer ID directly..."
+            value={directDialInput}
+            onChange={(e) => setDirectDialInput(e.target.value)}
             disabled={callStatus === 'Connected' || callStatus === 'Calling'}
           />
           {callStatus === 'Connected' || callStatus === 'Calling' ? (
             <button
-              className="btn-primary"
+              className="btn-action-primary"
               style={{ background: '#ef4444' }}
-              onClick={endCall}
+              onClick={handleCallEnd}
             >
               <PhoneOff size={15} /> End
             </button>
           ) : (
             <button
-              className="btn-primary"
-              onClick={() => callPeer(remotePeerIdValue)}
-              disabled={!remotePeerIdValue || !peerId}
+              className="btn-action-secondary"
+              onClick={() => initiateCall(directDialInput)}
+              disabled={!directDialInput}
             >
-              <Phone size={15} /> Call
+              <Phone size={14} /> Call
             </button>
           )}
         </div>
       </div>
 
       {/* Video Stage Area */}
-      <div className="video-stage" ref={stageContainerRef}>
+      <main className="stage-area" ref={stageRef}>
         {callStatus === 'Idle' ? (
-          /* Idle / Lobby Preview: Full local preview */
+          /* Idle Lobby Preview */
           <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-            <div className="lobby-preview-tips">
-              Camera & Mic preview active. Share your link or enter a peer ID above.
+            <div className="idle-overlay-guide">
+              <Sparkles size={14} color="#38bdf8" />
+              <span>Share the room link with someone to start talking!</span>
             </div>
-            {renderLocalVideo(false)}
+            <VideoTile
+              stream={localStream}
+              label="You (Preview)"
+              isLocal={true}
+              isAudioMuted={isAudioMuted}
+              isVideoMuted={isVideoMuted}
+              isScreenSharing={isScreenSharing}
+            />
           </div>
         ) : layoutMode === 'grid' ? (
-          /* Grid Mode: Side-by-side equal split */
-          <div className="layout-grid">
-            {renderLocalVideo(false)}
-            {renderRemoteVideo(false)}
+          /* Grid Mode: Side-by-Side */
+          <div className="stage-grid">
+            <VideoTile
+              stream={localStream}
+              label="You"
+              isLocal={true}
+              isAudioMuted={isAudioMuted}
+              isVideoMuted={isVideoMuted}
+              isScreenSharing={isScreenSharing}
+            />
+            <VideoTile
+              stream={remoteStream}
+              label="Peer"
+              isLocal={false}
+              peerStatus={callStatus === 'Calling' ? 'Calling peer...' : 'Connecting...'}
+            />
           </div>
         ) : (
-          /* Spotlight / Picture-in-Picture Mode */
-          <div className="layout-pip">
-            <div className="remote-video-container">
-              {isSwapped ? renderLocalVideo(false) : renderRemoteVideo(false)}
+          /* Spotlight / PiP Mode */
+          <div className="stage-pip">
+            {/* Main Full-Size Video */}
+            <div className="main-view">
+              <VideoTile
+                stream={showMainStream}
+                label={showMainLabel}
+                isLocal={showMainIsLocal}
+                isAudioMuted={showMainAudioMuted}
+                isVideoMuted={showMainVideoMuted}
+                isScreenSharing={showMainIsLocal && isScreenSharing}
+                peerStatus={callStatus === 'Calling' ? 'Calling peer...' : 'Connecting...'}
+              />
             </div>
-            <div className="local-video-container">
-              {isSwapped ? renderRemoteVideo(true) : renderLocalVideo(true)}
+
+            {/* Floating PiP Thumbnail */}
+            <div
+              className="pip-overlay"
+              onClick={() => setIsSwapped(!isSwapped)}
+              title="Tap to swap screens"
+            >
+              <VideoTile
+                stream={showPipStream}
+                label={showPipLabel}
+                isLocal={showPipIsLocal}
+                isAudioMuted={showPipAudioMuted}
+                isVideoMuted={showPipVideoMuted}
+                isScreenSharing={showPipIsLocal && isScreenSharing}
+                isPip={true}
+              />
             </div>
           </div>
         )}
 
-        {/* In-Call Floating Control Dock */}
-        <div className="floating-dock">
-          {/* Mic */}
+        {/* Floating Controls Dock */}
+        <div className="control-dock">
+          {/* Mute Mic */}
           <button
-            className={`btn-icon ${isAudioMuted ? 'danger' : ''}`}
+            className={`dock-btn ${isAudioMuted ? 'is-danger' : ''}`}
             onClick={toggleAudio}
-            title={isAudioMuted ? 'Unmute Microphone' : 'Mute Microphone'}
+            title={isAudioMuted ? 'Unmute Mic' : 'Mute Mic'}
           >
             {isAudioMuted ? <MicOff size={19} /> : <Mic size={19} />}
           </button>
 
-          {/* Camera */}
+          {/* Toggle Video */}
           <button
-            className={`btn-icon ${isVideoMuted ? 'danger' : ''}`}
+            className={`dock-btn ${isVideoMuted ? 'is-danger' : ''}`}
             onClick={toggleVideo}
-            title={isVideoMuted ? 'Start Camera' : 'Stop Camera'}
+            title={isVideoMuted ? 'Start Video' : 'Stop Video'}
           >
             {isVideoMuted ? <VideoOff size={19} /> : <VideoIcon size={19} />}
           </button>
 
-          {/* Screen Share */}
-          <button
-            className={`btn-icon ${isScreenSharing ? 'active' : ''}`}
-            onClick={toggleScreenShare}
-            title={isScreenSharing ? 'Stop Screen Share' : 'Share Screen'}
-          >
-            {isScreenSharing ? <MonitorOff size={19} /> : <Monitor size={19} />}
-          </button>
+          {/* Flip Mobile Camera (Front / Rear) */}
+          {hasMultipleCameras && (
+            <button
+              className="dock-btn"
+              onClick={flipCamera}
+              title="Flip Camera (Front/Rear)"
+            >
+              <SwitchCamera size={19} />
+            </button>
+          )}
 
-          {/* Layout Switcher (Grid vs PiP) */}
+          {/* Screen Share (Desktop / Supported Browsers) */}
+          {navigator.mediaDevices?.getDisplayMedia && (
+            <button
+              className={`dock-btn ${isScreenSharing ? 'is-active' : ''}`}
+              onClick={toggleScreenShare}
+              title={isScreenSharing ? 'Stop Screen Share' : 'Share Screen'}
+            >
+              {isScreenSharing ? <MonitorOff size={19} /> : <Monitor size={19} />}
+            </button>
+          )}
+
+          {/* Layout Toggle (PiP / Grid) */}
           {callStatus !== 'Idle' && (
             <button
-              className={`btn-icon ${layoutMode === 'grid' ? 'active' : ''}`}
+              className={`dock-btn ${layoutMode === 'grid' ? 'is-active' : ''}`}
               onClick={() => setLayoutMode(layoutMode === 'pip' ? 'grid' : 'pip')}
-              title={layoutMode === 'pip' ? 'Switch to Grid View' : 'Switch to Spotlight View'}
+              title={layoutMode === 'pip' ? 'Grid View' : 'Spotlight View'}
             >
               <LayoutGrid size={19} />
             </button>
@@ -616,26 +718,30 @@ export default function App() {
 
           {/* Fullscreen */}
           <button
-            className="btn-icon"
+            className="dock-btn"
             onClick={toggleFullscreen}
             title={isFullscreen ? 'Exit Fullscreen' : 'Enter Fullscreen'}
           >
             {isFullscreen ? <Minimize size={19} /> : <Maximize size={19} />}
           </button>
 
-          {/* End Call / Leave button */}
+          {/* Leave Call */}
           {(callStatus === 'Connected' || callStatus === 'Calling') && (
-            <button className="btn-icon end-call" onClick={endCall}>
+            <button
+              className="dock-btn leave-btn"
+              onClick={handleCallEnd}
+              title="Leave Call"
+            >
               <PhoneOff size={18} />
               <span>Leave</span>
             </button>
           )}
         </div>
-      </div>
+      </main>
 
-      {/* Toast Notification */}
+      {/* Floating Toast Notification */}
       {toastMessage && (
-        <div className="toast">
+        <div className="app-toast">
           <span>{toastMessage}</span>
         </div>
       )}
