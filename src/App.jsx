@@ -23,12 +23,6 @@ import {
 } from 'lucide-react';
 
 import VideoTile from './components/VideoTile';
-import {
-  startRingtone,
-  stopRingtone,
-  playConnectChime,
-  playDisconnectChime,
-} from './utils/audioEffects';
 
 // List of high-availability STUN servers for NAT traversal
 const ICE_SERVERS = [
@@ -53,7 +47,7 @@ export default function App() {
   const [callDuration, setCallDuration] = useState(0);
 
   // Controls state
-  const [isAudioMuted, setIsAudioMuted] = useState(false);
+  const [isAudioMuted, setIsAudioMuted] = useState(true);
   const [isVideoMuted, setIsVideoMuted] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [isFacingUser, setIsFacingUser] = useState(true);
@@ -75,6 +69,7 @@ export default function App() {
   const stageRef = useRef(null);
   const toastTimerRef = useRef(null);
   const callTimeoutRef = useRef(null);
+  const isAudioMutedRef = useRef(true);
 
   // Navigate to clean new room
   const handleCreateNewRoom = () => {
@@ -140,6 +135,12 @@ export default function App() {
         },
       });
 
+      // Ensure audio tracks match current mute state (default muted)
+      const audioTracks = stream.getAudioTracks();
+      audioTracks.forEach((t) => {
+        t.enabled = !isAudioMutedRef.current;
+      });
+
       localStreamRef.current = stream;
       setLocalStream(stream);
 
@@ -186,7 +187,6 @@ export default function App() {
 
       function attachPeerListeners(p, isAttemptingHost) {
         p.on('call', (incoming) => {
-          startRingtone();
           setIncomingCallData(incoming);
           setCallStatus('Incoming');
         });
@@ -219,7 +219,6 @@ export default function App() {
           }
 
           if (err.type === 'peer-unavailable') {
-            stopRingtone();
             if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
             if (activeCallRef.current) {
               activeCallRef.current.close();
@@ -262,7 +261,6 @@ export default function App() {
     setupRoomAndPeer();
 
     return () => {
-      stopRingtone();
       if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (activeCallRef.current) activeCallRef.current.close();
@@ -288,13 +286,11 @@ export default function App() {
 
     setCallStatus('Calling');
     setErrorMessage('');
-    startRingtone();
 
     const streamToSend = currentLocalStream || localStreamRef.current;
     const call = p.call(remoteId, streamToSend);
 
     if (!call) {
-      stopRingtone();
       setCallStatus('Idle');
       setErrorMessage('Could not initiate call to peer.');
       return;
@@ -303,7 +299,6 @@ export default function App() {
     if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
     callTimeoutRef.current = setTimeout(() => {
       if (callStatus === 'Calling' || activeCallRef.current) {
-        stopRingtone();
         showToast('No answer from peer');
         handleCallEnd();
       }
@@ -316,9 +311,7 @@ export default function App() {
   // Bind call stream events
   const bindCallEvents = (call) => {
     call.on('stream', (incomingStream) => {
-      stopRingtone();
       if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
-      playConnectChime();
       setRemoteStream(incomingStream);
       setCallStatus('Connected');
       showToast('Connected with peer');
@@ -338,7 +331,6 @@ export default function App() {
   const answerIncomingCall = () => {
     if (!incomingCallData) return;
 
-    stopRingtone();
     if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
     const stream = localStreamRef.current;
     incomingCallData.answer(stream);
@@ -351,7 +343,6 @@ export default function App() {
 
   // Reject incoming call
   const rejectIncomingCall = () => {
-    stopRingtone();
     if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
     if (incomingCallData) {
       incomingCallData.close();
@@ -363,9 +354,7 @@ export default function App() {
 
   // End active call
   const handleCallEnd = () => {
-    stopRingtone();
     if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
-    playDisconnectChime();
     if (isScreenSharing) {
       stopScreenShare();
     }
@@ -387,6 +376,7 @@ export default function App() {
         const nextState = !isAudioMuted;
         audioTracks.forEach((t) => (t.enabled = !nextState));
         setIsAudioMuted(nextState);
+        isAudioMutedRef.current = nextState;
         showToast(nextState ? 'Microphone muted' : 'Microphone active');
       }
     }
