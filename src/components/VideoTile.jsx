@@ -13,8 +13,10 @@ export default function VideoTile({
   onClick,
   onDoubleClick,
   peerStatus = '', // e.g. 'Calling...' or 'Connected'
+  videoRef: externalVideoRef,
 }) {
-  const videoRef = useRef(null);
+  const internalVideoRef = useRef(null);
+  const videoRef = externalVideoRef || internalVideoRef;
   const isSpeaking = useAudioActivity(stream, isAudioMuted);
 
   // Reliably bind stream to video element
@@ -31,6 +33,11 @@ export default function VideoTile({
       videoEl.setAttribute('playsinline', 'true');
       videoEl.setAttribute('webkit-playsinline', 'true');
 
+      if (!isLocal) {
+        videoEl.autoPictureInPicture = true;
+        videoEl.setAttribute('autopictureinpicture', 'true');
+      }
+
       const playPromise = videoEl.play();
       if (playPromise !== undefined) {
         playPromise.catch((err) => {
@@ -41,7 +48,7 @@ export default function VideoTile({
     } else {
       videoEl.srcObject = null;
     }
-  }, [stream, isLocal]);
+  }, [stream, isLocal, videoRef]);
 
   // Determine avatar initials
   const initials = isLocal
@@ -67,6 +74,7 @@ export default function VideoTile({
         autoPlay
         playsInline
         muted={isLocal}
+        autoPictureInPicture={!isLocal}
         className={`video-surface ${isLocal && !isScreenSharing ? 'mirrored' : ''}`}
         style={{ display: hasVideoTrack ? 'block' : 'none' }}
       />

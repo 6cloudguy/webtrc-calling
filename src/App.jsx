@@ -20,6 +20,11 @@ import {
   Sparkles,
   Share2,
   Plus,
+  PictureInPicture2,
+  MessageSquare,
+  Send,
+  X,
+  ShieldCheck,
 } from 'lucide-react';
 
 import VideoTile from './components/VideoTile';
@@ -61,6 +66,13 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState('');
   const [linkCopied, setLinkCopied] = useState(false);
 
+  // Floating PiP & Chat state
+  const [isFloatingPiP, setIsFloatingPiP] = useState(false);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+
   // Refs
   const peerRef = useRef(null);
   const activeCallRef = useRef(null);
@@ -70,6 +82,9 @@ export default function App() {
   const toastTimerRef = useRef(null);
   const callTimeoutRef = useRef(null);
   const isAudioMutedRef = useRef(true);
+  const remoteVideoRef = useRef(null);
+  const dataConnRef = useRef(null);
+  const chatBottomRef = useRef(null);
 
   // Navigate to clean new room
   const handleCreateNewRoom = () => {
@@ -185,10 +200,50 @@ export default function App() {
 
       const targetHostId = `vcr-${currentRoom}-host`;
 
+      function bindDataConnection(conn) {
+        if (!conn) return;
+        dataConnRef.current = conn;
+
+        conn.on('open', () => {
+          console.log('P2P DataChannel open');
+        });
+
+        conn.on('data', (data) => {
+          if (data && data.type === 'chat') {
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                id: Math.random().toString(36).substring(2, 9),
+                sender: 'peer',
+                text: data.text,
+                time: data.time || Date.now(),
+              },
+            ]);
+            setIsChatOpen((isOpen) => {
+              if (!isOpen) {
+                setUnreadChatCount((prev) => prev + 1);
+                showToast(`New message: ${data.text.slice(0, 30)}`);
+              }
+              return isOpen;
+            });
+          }
+        });
+
+        conn.on('close', () => {
+          if (dataConnRef.current === conn) {
+            dataConnRef.current = null;
+          }
+        });
+      }
+
       function attachPeerListeners(p, isAttemptingHost) {
         p.on('call', (incoming) => {
           setIncomingCallData(incoming);
           setCallStatus('Incoming');
+        });
+
+        p.on('connection', (conn) => {
+          bindDataConnection(conn);
         });
 
         p.on('disconnected', () => {
@@ -265,6 +320,10 @@ export default function App() {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (activeCallRef.current) activeCallRef.current.close();
       if (peerRef.current) peerRef.current.destroy();
+      if (dataConnRef.current) {
+        dataConnRef.current.close();
+        dataConnRef.current = null;
+      }
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
@@ -286,6 +345,39 @@ export default function App() {
 
     setCallStatus('Calling');
     setErrorMessage('');
+
+    // Also establish P2P DataChannel connection for in-call messaging
+    try {
+      const conn = p.connect(remoteId);
+      if (conn) {
+        dataConnRef.current = conn;
+        conn.on('open', () => {
+          console.log('Outgoing P2P DataChannel open');
+        });
+        conn.on('data', (data) => {
+          if (data && data.type === 'chat') {
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                id: Math.random().toString(36).substring(2, 9),
+                sender: 'peer',
+                text: data.text,
+                time: data.time || Date.now(),
+              },
+            ]);
+            setIsChatOpen((isOpen) => {
+              if (!isOpen) {
+                setUnreadChatCount((count) => count + 1);
+                showToast(`New message: ${data.text.slice(0, 30)}`);
+              }
+              return isOpen;
+            });
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('Could not establish DataChannel:', e);
+    }
 
     const streamToSend = currentLocalStream || localStreamRef.current;
     const call = p.call(remoteId, streamToSend);
@@ -362,11 +454,122 @@ export default function App() {
       activeCallRef.current.close();
       activeCallRef.current = null;
     }
+    if (dataConnRef.current) {
+      dataConnRef.current.close();
+      dataConnRef.current = null;
+    }
+    setChatMessages([]);
+    setUnreadChatCount(0);
+    setIsChatOpen(false);
     setRemoteStream(null);
     setCallStatus('Idle');
     setIncomingCallData(null);
     showToast('Call ended');
   };
+
+  // Toggle Floating Window (Picture-in-Picture)
+  const toggleFloatingPiP = async () => {
+    try {
+      const videoEl =
+        remoteVideoRef.current ||
+        document.querySelector('.stage-area video:not([muted])') ||
+        document.querySelector('.stage-area video');
+
+      if (!videoEl) {
+        showToast('No video available for floating window');
+        return;
+      }
+
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        setIsFloatingPiP(false);
+      } else if (videoEl.requestPictureInPicture) {
+        await videoEl.requestPictureInPicture();
+        setIsFloatingPiP(true);
+      } else if (videoEl.webkitSetPresentationMode) {
+        videoEl.webkitSetPresentationMode(
+          videoEl.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture'
+        );
+      } else {
+        showToast('Floating window not supported by this browser');
+      }
+    } catch (err) {
+      console.warn('PiP error:', err);
+      showToast('Could not open floating window');
+    }
+  };
+
+  // Automatic Floating Window when pressing Home or switching apps/tabs on mobile
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'hidden' && callStatus === 'Connected') {
+        const videoEl =
+          remoteVideoRef.current ||
+          document.querySelector('.stage-area video:not([muted])') ||
+          document.querySelector('.stage-area video');
+
+        if (videoEl && !document.pictureInPictureElement) {
+          try {
+            if (videoEl.requestPictureInPicture) {
+              await videoEl.requestPictureInPicture();
+            } else if (videoEl.webkitSetPresentationMode) {
+              videoEl.webkitSetPresentationMode('picture-in-picture');
+            }
+          } catch (e) {
+            console.log('Background PiP request:', e.message);
+          }
+        }
+      }
+    };
+
+    const handleEnterPiP = () => setIsFloatingPiP(true);
+    const handleLeavePiP = () => setIsFloatingPiP(false);
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    document.addEventListener('enterpictureinpicture', handleEnterPiP);
+    document.addEventListener('leavepictureinpicture', handleLeavePiP);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      document.removeEventListener('enterpictureinpicture', handleEnterPiP);
+      document.removeEventListener('leavepictureinpicture', handleLeavePiP);
+    };
+  }, [callStatus]);
+
+  // Send in-call chat message
+  const sendChatMessage = (e) => {
+    if (e) e.preventDefault();
+    const text = chatInput.trim();
+    if (!text) return;
+
+    const msg = {
+      type: 'chat',
+      text,
+      time: Date.now(),
+    };
+
+    if (dataConnRef.current && dataConnRef.current.open) {
+      dataConnRef.current.send(msg);
+    }
+
+    setChatMessages((prev) => [
+      ...prev,
+      {
+        id: Math.random().toString(36).substring(2, 9),
+        sender: 'me',
+        text,
+        time: msg.time,
+      },
+    ]);
+    setChatInput('');
+  };
+
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    if (isChatOpen) {
+      chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages, isChatOpen]);
 
   // Toggle Microphone
   const toggleAudio = () => {
@@ -509,10 +712,16 @@ export default function App() {
 
         <div className="header-status-area">
           {callStatus === 'Connected' && (
-            <div className="call-timer">
-              <Clock size={13} />
-              <span>{formatTimer(callDuration)}</span>
-            </div>
+            <>
+              <div className="call-security-badge" title="Direct WebRTC Peer-to-Peer connection">
+                <ShieldCheck size={13} color="#10b981" />
+                <span>P2P Direct</span>
+              </div>
+              <div className="call-timer">
+                <Clock size={13} />
+                <span>{formatTimer(callDuration)}</span>
+              </div>
+            </>
           )}
 
           <div
@@ -694,6 +903,7 @@ export default function App() {
               label="Peer"
               isLocal={false}
               peerStatus={callStatus === 'Calling' ? 'Calling peer...' : 'Connecting...'}
+              videoRef={remoteVideoRef}
             />
           </div>
         ) : (
@@ -709,6 +919,7 @@ export default function App() {
                 isVideoMuted={showMainVideoMuted}
                 isScreenSharing={showMainIsLocal && isScreenSharing}
                 peerStatus={callStatus === 'Calling' ? 'Calling peer...' : 'Connecting...'}
+                videoRef={showMainIsLocal ? null : remoteVideoRef}
               />
             </div>
 
@@ -726,9 +937,74 @@ export default function App() {
                 isVideoMuted={showPipVideoMuted}
                 isScreenSharing={showPipIsLocal && isScreenSharing}
                 isPip={true}
+                videoRef={showPipIsLocal ? null : remoteVideoRef}
               />
             </div>
           </div>
+        )}
+
+        {/* In-Call P2P Chat Drawer */}
+        {isChatOpen && callStatus === 'Connected' && (
+          <aside className="chat-drawer">
+            <div className="chat-header">
+              <div className="chat-header-title">
+                <MessageSquare size={16} />
+                <span>In-Call Chat</span>
+                <span className="chat-encryption-tag">P2P</span>
+              </div>
+              <button
+                className="chat-close-btn"
+                onClick={() => setIsChatOpen(false)}
+                title="Close Chat"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="chat-messages-list">
+              {chatMessages.length === 0 ? (
+                <div className="chat-empty-state">
+                  <p>No messages yet.</p>
+                  <span>Direct peer-to-peer messaging. Private & vanishes when call ends.</span>
+                </div>
+              ) : (
+                chatMessages.map((m) => (
+                  <div
+                    key={m.id}
+                    className={`chat-bubble ${m.sender === 'me' ? 'sent' : 'received'}`}
+                  >
+                    <div className="chat-bubble-sender">
+                      {m.sender === 'me' ? 'You' : 'Peer'}
+                    </div>
+                    <div className="chat-bubble-text">{m.text}</div>
+                    <div className="chat-bubble-time">
+                      {new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </div>
+                  </div>
+                ))
+              )}
+              <div ref={chatBottomRef} />
+            </div>
+
+            <form className="chat-input-row" onSubmit={sendChatMessage}>
+              <input
+                type="text"
+                className="chat-input-field"
+                placeholder="Type a message..."
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                autoFocus
+              />
+              <button
+                type="submit"
+                className="chat-send-btn"
+                disabled={!chatInput.trim()}
+                title="Send message"
+              >
+                <Send size={15} />
+              </button>
+            </form>
+          </aside>
         )}
 
         {/* Floating Controls Dock */}
@@ -770,6 +1046,34 @@ export default function App() {
               title={isScreenSharing ? 'Stop Screen Share' : 'Share Screen'}
             >
               {isScreenSharing ? <MonitorOff size={19} /> : <Monitor size={19} />}
+            </button>
+          )}
+
+          {/* Floating Picture-in-Picture Window (Mobile / Desktop) */}
+          {callStatus === 'Connected' && (
+            <button
+              className={`dock-btn ${isFloatingPiP ? 'is-active' : ''}`}
+              onClick={toggleFloatingPiP}
+              title={isFloatingPiP ? 'Close Floating Window' : 'Floating Window (Picture-in-Picture)'}
+            >
+              <PictureInPicture2 size={19} />
+            </button>
+          )}
+
+          {/* In-Call P2P Chat */}
+          {callStatus === 'Connected' && (
+            <button
+              className={`dock-btn chat-btn ${isChatOpen ? 'is-active' : ''}`}
+              onClick={() => {
+                setIsChatOpen(!isChatOpen);
+                setUnreadChatCount(0);
+              }}
+              title="In-call Chat"
+            >
+              <MessageSquare size={19} />
+              {unreadChatCount > 0 && (
+                <span className="unread-dot">{unreadChatCount}</span>
+              )}
             </button>
           )}
 
