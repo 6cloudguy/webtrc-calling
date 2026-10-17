@@ -19,6 +19,7 @@ import {
   Clock,
   Sparkles,
   Share2,
+  Plus,
 } from 'lucide-react';
 
 import VideoTile from './components/VideoTile';
@@ -45,6 +46,7 @@ export default function App() {
   // Connection & Room state
   const [myPeerId, setMyPeerId] = useState('');
   const [roomName, setRoomName] = useState('');
+  const [isHost, setIsHost] = useState(true);
   const [directDialInput, setDirectDialInput] = useState('');
   const [callStatus, setCallStatus] = useState('Idle'); // 'Idle' | 'Calling' | 'Connected' | 'Incoming'
   const [incomingCallData, setIncomingCallData] = useState(null);
@@ -72,6 +74,14 @@ export default function App() {
   const screenStreamRef = useRef(null);
   const stageRef = useRef(null);
   const toastTimerRef = useRef(null);
+  const callTimeoutRef = useRef(null);
+
+  // Navigate to clean new room
+  const handleCreateNewRoom = () => {
+    const newRoom = 'room-' + Math.random().toString(36).substring(2, 8);
+    const newUrl = `${window.location.origin}${window.location.pathname}?room=${newRoom}`;
+    window.location.href = newUrl;
+  };
 
   // Toast notifier
   const showToast = useCallback((msg) => {
@@ -164,7 +174,6 @@ export default function App() {
       // 2. Parse room name from query param or generate friendly room name
       const params = new URLSearchParams(window.location.search);
       let currentRoom = params.get('room');
-      const isNewRoom = !currentRoom;
 
       if (!currentRoom) {
         currentRoom = 'room-' + Math.random().toString(36).substring(2, 8);
@@ -173,55 +182,71 @@ export default function App() {
       }
       setRoomName(currentRoom);
 
-      // Clean deterministic IDs for room auto-peering:
-      // Host uses: `vcr-${currentRoom}-host`
-      // Guest uses: `vcr-${currentRoom}-guest-${random}`
       const targetHostId = `vcr-${currentRoom}-host`;
-      const isJoiningAsGuest = !isNewRoom;
 
-      const myIdToRegister = isJoiningAsGuest
-        ? `vcr-${currentRoom}-guest-${Math.random().toString(36).substring(2, 6)}`
-        : targetHostId;
+      function attachPeerListeners(p, isAttemptingHost) {
+        p.on('call', (incoming) => {
+          startRingtone();
+          setIncomingCallData(incoming);
+          setCallStatus('Incoming');
+        });
 
-      peer = new Peer(myIdToRegister, {
+        p.on('disconnected', () => {
+          console.log('Peer disconnected from signaling server, reconnecting...');
+          if (!p.destroyed) {
+            p.reconnect();
+          }
+        });
+
+        p.on('error', (err) => {
+          console.warn('Peer error:', err.type, err);
+          if (err.type === 'unavailable-id') {
+            if (isAttemptingHost) {
+              // Host is already active in this room! Reconnect cleanly as guest
+              const guestId = `vcr-${currentRoom}-guest-${Math.random().toString(36).substring(2, 6)}`;
+              p.destroy();
+              const guestPeer = new Peer(guestId, { config: { iceServers: ICE_SERVERS } });
+              guestPeer.on('open', (newId) => {
+                setMyPeerId(newId);
+                peerRef.current = guestPeer;
+                setIsHost(false);
+                showToast(`Ready to join room '${currentRoom}'`);
+              });
+              attachPeerListeners(guestPeer, false);
+              peerRef.current = guestPeer;
+              return;
+            }
+          }
+
+          if (err.type === 'peer-unavailable') {
+            stopRingtone();
+            if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
+            if (activeCallRef.current) {
+              activeCallRef.current.close();
+              activeCallRef.current = null;
+            }
+            setCallStatus('Idle');
+            setErrorMessage('The host is not currently online in this room. Please make sure they have opened the room link.');
+            showToast('Host is not online');
+            return;
+          }
+
+          setErrorMessage(`Connection notice: ${err.message || err.type}`);
+        });
+      }
+
+      // Try registering as host first
+      peer = new Peer(targetHostId, {
         config: { iceServers: ICE_SERVERS },
       });
 
       peer.on('open', (id) => {
         setMyPeerId(id);
-        console.log('Peer connected with ID:', id);
-
-        // If joining as guest into an existing room, auto-call the host!
-        if (isJoiningAsGuest) {
-          showToast(`Connecting to room '${currentRoom}'...`);
-          setTimeout(() => {
-            initiateCall(targetHostId, stream || localStreamRef.current, peer);
-          }, 600);
-        }
+        setIsHost(true);
+        console.log('Peer connected as host with ID:', id);
       });
 
-      // Handle room host ID collision (if host already exists, fallback to guest and call host)
-      peer.on('error', (err) => {
-        console.warn('Peer error:', err.type, err);
-        if (err.type === 'unavailable-id') {
-          // Host was already present! Reconnect as guest
-          const guestId = `vcr-${currentRoom}-guest-${Math.random().toString(36).substring(2, 6)}`;
-          peer.destroy();
-          const fallbackPeer = new Peer(guestId, { config: { iceServers: ICE_SERVERS } });
-          fallbackPeer.on('open', (newId) => {
-            setMyPeerId(newId);
-            peerRef.current = fallbackPeer;
-            showToast(`Joining room '${currentRoom}'...`);
-            initiateCall(targetHostId, stream || localStreamRef.current, fallbackPeer);
-          });
-          bindPeerEvents(fallbackPeer);
-          peerRef.current = fallbackPeer;
-          return;
-        }
-        setErrorMessage(`Connection notice: ${err.message || err.type}`);
-      });
-
-      bindPeerEvents(peer);
+      attachPeerListeners(peer, true);
       peerRef.current = peer;
 
       // 3. Heartbeat to keep PeerJS cloud WebSocket alive & reconnect if disconnected
@@ -234,24 +259,11 @@ export default function App() {
       }, 15000);
     }
 
-    function bindPeerEvents(p) {
-      p.on('call', (incoming) => {
-        // Play ringtone
-        startRingtone();
-        setIncomingCallData(incoming);
-        setCallStatus('Incoming');
-      });
-
-      p.on('disconnected', () => {
-        console.log('Peer disconnected from signaling server, reconnecting...');
-        p.reconnect();
-      });
-    }
-
     setupRoomAndPeer();
 
     return () => {
       stopRingtone();
+      if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (activeCallRef.current) activeCallRef.current.close();
       if (peerRef.current) peerRef.current.destroy();
@@ -269,6 +281,11 @@ export default function App() {
     const p = peerInstanceOverride || peerRef.current;
     if (!remoteId || !p) return;
 
+    if (remoteId === p.id || remoteId === myPeerId) {
+      showToast('Cannot call yourself. Open the link on another device or tab.');
+      return;
+    }
+
     setCallStatus('Calling');
     setErrorMessage('');
     startRingtone();
@@ -283,6 +300,15 @@ export default function App() {
       return;
     }
 
+    if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
+    callTimeoutRef.current = setTimeout(() => {
+      if (callStatus === 'Calling' || activeCallRef.current) {
+        stopRingtone();
+        showToast('No answer from peer');
+        handleCallEnd();
+      }
+    }, 30000);
+
     bindCallEvents(call);
     activeCallRef.current = call;
   };
@@ -291,6 +317,7 @@ export default function App() {
   const bindCallEvents = (call) => {
     call.on('stream', (incomingStream) => {
       stopRingtone();
+      if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
       playConnectChime();
       setRemoteStream(incomingStream);
       setCallStatus('Connected');
@@ -312,6 +339,7 @@ export default function App() {
     if (!incomingCallData) return;
 
     stopRingtone();
+    if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
     const stream = localStreamRef.current;
     incomingCallData.answer(stream);
 
@@ -324,6 +352,7 @@ export default function App() {
   // Reject incoming call
   const rejectIncomingCall = () => {
     stopRingtone();
+    if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
     if (incomingCallData) {
       incomingCallData.close();
       setIncomingCallData(null);
@@ -335,6 +364,7 @@ export default function App() {
   // End active call
   const handleCallEnd = () => {
     stopRingtone();
+    if (callTimeoutRef.current) clearTimeout(callTimeoutRef.current);
     playDisconnectChime();
     if (isScreenSharing) {
       stopScreenShare();
@@ -454,7 +484,7 @@ export default function App() {
 
   // Copy shareable room link
   const copyRoomLink = () => {
-    const url = window.location.href;
+    const url = `${window.location.origin}${window.location.pathname}?room=${roomName}`;
     navigator.clipboard.writeText(url);
     setLinkCopied(true);
     showToast('Room link copied! Send it to your friend to join.');
@@ -512,7 +542,9 @@ export default function App() {
                 ? 'Calling...'
                 : callStatus === 'Incoming'
                 ? 'Incoming Call'
-                : 'Waiting for Peer'}
+                : isHost
+                ? 'Waiting for Peer'
+                : 'Ready to Join'}
             </span>
           </div>
         </div>
@@ -560,6 +592,26 @@ export default function App() {
             {linkCopied ? <Check size={14} /> : <Share2 size={14} />}
             <span>{linkCopied ? 'Link Copied!' : 'Share Room Link'}</span>
           </button>
+
+          {!isHost && callStatus === 'Idle' && (
+            <button
+              className="btn-action-primary btn-join-room"
+              onClick={() => initiateCall(`vcr-${roomName}-host`)}
+              title="Join room call"
+            >
+              <Phone size={14} />
+              <span>Join Room</span>
+            </button>
+          )}
+
+          <button
+            className="btn-action-secondary"
+            onClick={handleCreateNewRoom}
+            title="Create a fresh room"
+          >
+            <Plus size={14} />
+            <span>New Room</span>
+          </button>
         </div>
 
         {/* Direct Peer Dial option */}
@@ -599,8 +651,34 @@ export default function App() {
           <div style={{ width: '100%', height: '100%', position: 'relative' }}>
             <div className="idle-overlay-guide">
               <Sparkles size={14} color="#38bdf8" />
-              <span>Share the room link with someone to start talking!</span>
+              <span>
+                {isHost
+                  ? "You are hosting this room. Share the room link to invite someone to talk!"
+                  : `You're ready to join ${roomName}. Click "Join Room" when ready!`}
+              </span>
             </div>
+
+            {!isHost && (
+              <div className="lobby-join-card">
+                <h3>Ready to join?</h3>
+                <p>Room: <span className="room-highlight">{roomName}</span></p>
+                <div className="lobby-join-actions">
+                  <button
+                    className="btn-action-primary btn-hero-join"
+                    onClick={() => initiateCall(`vcr-${roomName}-host`)}
+                  >
+                    <Phone size={17} /> Join Room
+                  </button>
+                  <button
+                    className="btn-action-secondary"
+                    onClick={handleCreateNewRoom}
+                  >
+                    <Plus size={14} /> Start New Room
+                  </button>
+                </div>
+              </div>
+            )}
+
             <VideoTile
               stream={localStream}
               label="You (Preview)"
@@ -743,6 +821,14 @@ export default function App() {
       {toastMessage && (
         <div className="app-toast">
           <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Error Toast Notification */}
+      {errorMessage && (
+        <div className="app-toast error-toast">
+          <span>{errorMessage}</span>
+          <button className="toast-close" onClick={() => setErrorMessage('')}>×</button>
         </div>
       )}
     </div>
